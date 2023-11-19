@@ -1,0 +1,137 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: The infrastructure to create new administrators
+
+Parameters:
+  Username:
+    Type: String
+    AllowedPattern: "^[a-zA-Z][a-zA-Z0-9]{1,64}$"
+    Description: The username for the admin account
+    ConstraintDescription: User name must be between 2 and 64 alphanumeric characters in length, starting with an uppercase or lowercase character of the alphabet.
+
+  Password:
+    Type: String
+    Description: The initial password for the admin account (will be changed on first access)
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9!@#$%&]{8,32}$
+    Default: "pa$$word1"
+    ConstraintDescription: Password must be between 9 and 32 characters, start with lowercase or uppercase letter, and can be alphanumeric with the following special characters !@#$%&
+
+  Group:
+    Description: "The name of the group which you want to add the user to."
+    Type: String
+    Default: "DeveloperAdministrators"
+    AllowedValues:
+      - "AccountAdministrators"
+      - "DeveloperAdministrators"
+      - "DatabaseAdministrators"
+      - "NetworkAdministrators"
+
+  Serial:
+    Type: Number
+    Description: Incrementing this value notifies CloudFormation that you want to rotate your access key. When you update your stack, CloudFormation will replace the existing access key with a new key.
+    Default: 1
+
+Conditions:
+  isAccountAdmin: !Equals [ !Sub "${Group}", "AccountAdministrators"]
+  isDeveloperAdmin: !Equals [!Sub "${Group}", "DeveloperAdministrators"]
+  isDatabaseAdmin: !Equals [!Sub "${Group}", "DatabaseAdministrators"]
+  isNetworkAdmin: !Equals [!Sub "${Group}", "NetworkAdministrators"]
+
+Resources:
+  # Provides full access to AWS services and resources.
+  AccountAdminGroup:
+    Type: "AWS::IAM::Group"
+    Properties:
+      GroupName: AccountAdministrators
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+
+  # Grants full access permissions necessary for resources required for application and development operations.
+  # No user administration, billing. Just application related permissions for example rds, ec2, vpc, s3, lambda, etc
+  DeveloperAdminGroup:
+    Type: "AWS::IAM::Group"
+    Properties:
+      GroupName: DeveloperAdministrators
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/job-function/SystemAdministrator # https://us-east-1.console.aws.amazon.com/iam/home#/policies/arn:aws:iam::aws:policy/job-function/SystemAdministrator$serviceLevelSummary
+
+  # Grants full access permissions to AWS services and actions required to set up and configure AWS database services.
+  DatabaseAdminGroup:
+    Type: "AWS::IAM::Group"
+    Properties:
+      GroupName: DatabaseAdministrators
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/job-function/DatabaseAdministrator # https://us-east-1.console.aws.amazon.com/iam/home#/policies/arn:aws:iam::aws:policy/job-function/DatabaseAdministrator$serviceLevelSummary
+
+  # Grants full access permissions to AWS services and actions required to set up and configure AWS network resources.
+  NetworkAdminGroup:
+    Type: "AWS::IAM::Group"
+    Properties:
+      GroupName: DatabaseAdministrators
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/job-function/NetworkAdministrator # https://us-east-1.console.aws.amazon.com/iam/home#/policies/arn:aws:iam::aws:policy/job-function/NetworkAdministrator$serviceLevelSummary
+
+  User:
+    Type: "AWS::IAM::User"
+    Properties:
+      UserName: !Sub ${Username}
+      LoginProfile:
+        Password: !Sub ${Password}
+        PasswordResetRequired: true
+      Path: "/"
+
+  UserToAccountAdminGroup:
+    Type: "AWS::IAM::UserToGroupAddition"
+    Condition: isAccountAdmin
+    Properties:
+      GroupName: !Ref AccountAdminGroup
+      Users:
+        - !Ref User
+
+  UserToDeveloperAdminGroup:
+    Type: "AWS::IAM::UserToGroupAddition"
+    Condition: isDeveloperAdmin
+    Properties:
+      GroupName: !Ref DeveloperAdminGroup
+      Users:
+        - !Ref User
+
+  UserToDatabaseAdminGroup:
+    Type: "AWS::IAM::UserToGroupAddition"
+    Condition: isDatabaseAdmin
+    Properties:
+      GroupName: !Ref DatabaseAdminGroup
+      Users:
+        - !Ref User
+
+  UserToNetworkAdminGroup:
+    Type: "AWS::IAM::UserToGroupAddition"
+    Condition: isNetworkAdmin
+    Properties:
+      GroupName: !Ref NetworkAdminGroup
+      Users:
+        - !Ref User
+
+  AccessKey:
+    Type: "AWS::IAM::AccessKey"
+    Properties:
+      Serial: !Ref Serial
+      Status: 'Active'
+      UserName: !Ref User
+
+Outputs:
+  UserName: 
+    Description: The user name
+    Value: !Ref User
+
+  AccessKey:
+    Description: The access key
+    Value: !Ref AccessKey
+
+  SecretKey:
+    Description: The secret key
+    Value: !GetAtt AccessKey.SecretAccessKey
+

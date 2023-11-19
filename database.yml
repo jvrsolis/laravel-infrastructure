@@ -1,0 +1,202 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Template to deploy RDS Aurora Cluster
+Parameters:
+  StackKey:
+    Type: String
+    Description: The stack key that will identify the infrastructure
+    Default: laravel
+  Environment:
+    Type: String
+    Description: The identifier to use for the stacks. Should be the same across all templates (staging, production, testing..)
+    Default: staging
+    AllowedValues:
+      - production
+      - staging
+      - testing
+      - local 
+  DBInstanceType:
+    Type: String
+    Default: db.t3.medium
+    Description: The class of instance to use in the cluster
+
+  RedisInstanceType:
+    Type: String
+    Default: cache.t3.micro
+    Description: The class of instance to use for the redis cluster (cache.t3.micro - qa | cache.m5.large - production)
+
+Conditions:
+  isProduction: !Equals [ !Ref Environment, production]
+
+Resources:
+  # ---------------------------------------------------------------
+  # -
+  # Aurora MySql cluster
+  # -
+  # ---------------------------------------------------------------
+  DBSubnetGroup:
+    Type: "AWS::RDS::DBSubnetGroup"
+    Properties:
+      DBSubnetGroupDescription: RDS DB Subnet Group
+      SubnetIds:
+        - !ImportValue
+          "Fn::Sub": ${StackKey}-${Environment}-PrivateSubnet1
+        - !If
+          - isProduction
+          - !ImportValue
+            "Fn::Sub": ${StackKey}-${Environment}-PrivateSubnet2
+          - AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackKey}-${Environment}-db-subnet-group"
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Access to the RDS
+      VpcId: !ImportValue
+        "Fn::Sub": ${StackKey}-${Environment}-VPC
+  RDSSecurityGroupIngressFromWithinVPC:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Ingress from within the VPC
+      GroupId: !Ref "RDSSecurityGroup"
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      CidrIp: 10.0.0.0/16
+  RDSCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      DatabaseName: !Sub "${StackKey}-${Environment}-db"
+      MasterUsername: !Sub "{{resolve:ssm:/${StackKey}/${Environment}/AURORA_ROOT_USERNAME:1}}"
+      MasterUserPassword: !Sub "{{resolve:ssm-secure:/${StackKey}/${Environment}/AURORA_ROOT_PASSWORD:1}}"
+      Engine: aurora-mysql
+      EngineMode: provisioned
+      EngineVersion: "8.0.mysql_aurora.3.02.0"
+      DBClusterIdentifier: !Sub "${StackKey}-${Environment}-rds-cluster"
+      DBSubnetGroupName:
+        Ref: DBSubnetGroup
+      DBClusterParameterGroupName:
+        Ref: RDSDBClusterParameterGroup
+      StorageEncrypted: "true"
+      BackupRetentionPeriod: 14
+      VpcSecurityGroupIds:
+        - !Ref "RDSSecurityGroup"
+  RDSDBInstance1:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBSubnetGroupName:
+        Ref: DBSubnetGroup
+      DBParameterGroupName:
+        Ref: RDSDBParameterGroup
+      Engine: aurora-mysql
+      EngineVersion: "8.0.mysql_aurora.3.02.0"
+      DBInstanceIdentifier: db-1
+      DBClusterIdentifier:
+        Ref: RDSCluster
+      PubliclyAccessible: "false"
+      DBInstanceClass: !Ref "DBInstanceType"
+  RDSDBInstance2:
+    Type: AWS::RDS::DBInstance
+    Condition: isProduction
+    Properties:
+      DBSubnetGroupName:
+        Ref: DBSubnetGroup
+      DBParameterGroupName:
+        Ref: RDSDBParameterGroup
+      Engine: aurora-mysql
+      EngineVersion: "8.0.mysql_aurora.3.02.0"
+      DBInstanceIdentifier: db-2
+      DBClusterIdentifier:
+        Ref: RDSCluster
+      PubliclyAccessible: "false"
+      DBInstanceClass: !Ref "DBInstanceType"
+  RDSDBClusterParameterGroup:
+    Type: AWS::RDS::DBClusterParameterGroup
+    Properties:
+      Description: RDS Cluster Parameter Group
+      Family: aurora-mysql8.0
+      Parameters:
+        time_zone: UTC
+  RDSDBParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: RDS Sample Aurora Parameter Group
+      Family: aurora-mysql8.0
+      Parameters:
+        sql_mode: IGNORE_SPACE
+
+# ---------------------------------------------------------------
+# -
+# Redis cluster
+# -
+# ---------------------------------------------------------------
+  RedisSubnetGroup:
+      Type: "AWS::ElastiCache::SubnetGroup"
+      Properties:
+        CacheSubnetGroupName: !Sub "${StackKey}-${Environment}-redis-subnet-group"
+        Description: ElasticCache Subnet Group for redis cluster
+        SubnetIds:
+          - !ImportValue
+            "Fn::Sub": ${StackKey}-${Environment}-PrivateSubnet1
+          - !ImportValue
+            "Fn::Sub": ${StackKey}-${Environment}-PrivateSubnet2
+          - !If
+            - isProduction
+            - !ImportValue
+              "Fn::Sub": ${StackKey}-${Environment}-PrivateSubnet3
+            - !Ref 'AWS::NoValue'
+
+  RedisSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupName: !Sub "${StackKey}-${Environment}-redis-sg"
+        GroupDescription: Access to the Redis cluster
+        VpcId: !ImportValue
+          "Fn::Sub": ${StackKey}-${Environment}-VPC
+
+  RedisSecurityGroupIngressFromContainers:
+      Type: AWS::EC2::SecurityGroupIngress
+      Properties:
+        Description: Ingress from the containers
+        GroupId: !Ref "RedisSecurityGroup"
+        IpProtocol: tcp
+        FromPort: 6379
+        ToPort: 6379
+        SourceSecurityGroupId:
+          Fn::ImportValue: !Sub "${StackKey}-${Environment}-container-security-group"
+
+  RedisCluster:
+      Type: AWS::ElastiCache::CacheCluster
+      Properties:
+        CacheNodeType: !Ref "RedisInstanceType"
+        CacheSubnetGroupName: !Ref "RedisSubnetGroup"
+        ClusterName: !Sub "${StackKey}-${Environment}-redis"
+        Engine: redis
+        EngineVersion: 3.2.10
+        NumCacheNodes: 1
+        Port: 6379
+        VpcSecurityGroupIds:
+          - !Ref "RedisSecurityGroup"
+
+  RedisInternalDNSRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !ImportValue
+        "Fn::Sub": ${StackKey}-${Environment}-DNSZone
+      Name: !Sub "redis.${StackKey}-${Environment}.int."
+      ResourceRecords:
+        - !GetAtt [RedisCluster, RedisEndpoint.Address]
+      Type: CNAME
+      TTL: 300
+
+Outputs:
+  DBClusterEndpoint:
+    Description: "The connection endpoint for the DB cluster."
+    Value: !GetAtt "RDSCluster.Endpoint.Address"
+    Export:
+      Name: !Sub "${StackKey}-${Environment}-db-endpoint"
+  DBClusterReadEndpoint:
+    Description: "The reader endpoint for the DB cluster."
+    Value: !GetAtt "RDSCluster.ReadEndpoint.Address"
+    Export:
+      Name: !Sub "${StackKey}-${Environment}-db-read-endpoint"

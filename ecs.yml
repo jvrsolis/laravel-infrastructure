@@ -1,0 +1,475 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: The infrastructure for all Web Containers
+
+Parameters:
+  StackKey:
+    Type: String
+    Description: The identifier to use for the stacks. Should be the same across all templates (qa, staging, production, testing..)
+    Default: blink
+  Environment:
+    Type: String
+    Description: The identifier to use for the stacks. Should be the same across all templates (staging, production, testing..)
+    Default: staging
+    AllowedValues:
+      - production
+      - staging
+      - development
+      - local
+  InstanceType:
+    Description: EC2 instance types to use in our cluster
+    Type: String
+    Default: t2.micro
+  ClusterSize:
+    Description: Number of EC2 instances in our ECS cluster
+    Type: String
+    Default: 1
+  CertificateArn:
+    Description: The AWS ARN of the SSL certificate to be used by the load-balancer
+    Type: String
+  HostedZoneDomain:
+    Type: String
+    Description: The domain of a hosted zone in the account. (laravelaws.com)
+    Default: laravelaws.com
+  Domain:
+    Description: Second level domain name for your application (for example example.laravelaws.com)
+    Type: String
+
+Conditions:
+  isProduction: !Equals [!Ref Environment, production]
+
+Mappings:
+  # Elastic Load Balancer Region Account IDs (AWS specific hardcoded values)
+  #
+  # You can find the latest ELB account IDs per regions here:
+  # https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-access-logs.html#access-logging-bucket-permissions
+  RegionToELBAccount:
+    us-east-1:
+      id: 127311923021
+    us-east-2:
+      id: 033677994240
+    us-west-1:
+      id: 027434742980
+    us-west-2:
+      id: 797873946194
+
+  # ECS optimized Amazon Linux 2 AMIs (AWS specific hardcoded values)
+  #
+  # You can find the latest available on this page of our documentation:
+  # http://docs.aws.amazon.com/AmazonECS/latest/developerguide/ecs-optimized_AMI.html
+  AWSRegionToAMI:
+    us-east-1:
+      AMI: ami-040d909ea4e56f8f3
+    us-east-2:
+      AMI: ami-09ce6553a7f2ae75d
+    us-west-1:
+      AMI: ami-091c5e73d3a79e85e
+    us-west-2:
+      AMI: ami-02c6f7952af6bd632
+
+Resources:
+  ApplicationImage:
+    Type: "AWS::ECR::Repository"
+    Properties:
+      RepositoryName: !Sub ${StackKey}-${Environment}-application-image-repository
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":10,"description":"expire rev- after 25 images","selection":{"tagStatus":"tagged","tagPrefixList":["rev-"],"countType":"imageCountMoreThan","countNumber":25},"action":{"type":"expire"}}]}'
+        RegistryId: !Ref "AWS::AccountId"
+
+  ## ECS Configuration ##
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ecs-tasks.amazonaws.com, ecs.amazonaws.com]
+            Action: ["sts:AssumeRole"]
+      Path: /
+      Policies:
+        - PolicyName: TaskExecutionRolePolicy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  # Allow the ECS Tasks to download images from ECR
+                  - "ecr:GetAuthorizationToken"
+                  - "ecr:BatchCheckLayerAvailability"
+                  - "ecr:GetDownloadUrlForLayer"
+                  - "ecr:BatchGetImage"
+
+                  # Allow the ECS tasks to upload logs to CloudWatch
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackKey}-${Environment}-task-execution-role"
+
+  ApplicationEcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${StackKey}-${Environment}-application-ecs-cluster
+
+  ApplicationTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ecs-tasks.amazonaws.com, ecs.amazonaws.com]
+            Action: ["sts:AssumeRole"]
+      Policies:
+        - PolicyName: ApplicationTaskRole
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  # Allow the retrieval of SSM Params
+                  - "kms:Decrypt"
+                  - "ssm:GetParameterHistory"
+                  - "ssm:GetParameter"
+                  - "ssm:GetParameters"
+                  - "ssm:GetParametersByPath"
+
+                  # Allow access to S3 bucket
+                  - "s3:Get*"
+                  - "s3:CreateBucket"
+                  - "s3:List*"
+                  - "s3:Put*"
+                  - "s3:DeleteObject"
+
+                  - "ecr:GetAuthorizationToken"
+                  - "ecr:BatchCheckLayerAvailability"
+                  - "ecr:GetDownloadUrlForLayer"
+                  - "ecr:BatchGetImage"
+
+                  # Allow access to cloudwatch logs
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:DescribeLogGroups"
+                  - "logs:DescribeLogStreams"
+
+                  # Allow the ECS tasks to upload logs to CloudWatch
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+
+                  # Allow access to SQS
+                  - sqs:ChangeMessageVisibility
+                  - sqs:CreateQueue
+                  - sqs:DeleteMessage*
+                  - sqs:Get*
+                  - sqs:List*
+                  - sqs:ReceiveMessage
+                  - sqs:SendMessage*
+
+                  - ses:SendRawEmail
+                Resource: "*"
+
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackKey}-${Environment}-application-task-role"
+
+  ApplicationLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    Properties:
+      LogGroupName: !Sub ${StackKey}-${Environment}-application-log-group
+      RetentionInDays: 14
+
+  ApplicationTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${StackKey}-${Environment}-application
+      Cpu: "1024"
+      Memory: "2048"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !Ref ApplicationTaskRole
+      ContainerDefinitions:
+        - Name: ApplicationContainer
+          Cpu: 1024
+          Memory: 2048
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ApplicationImage}:latest
+          PortMappings:
+            - ContainerPort: 80
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ApplicationLogGroup
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: application-
+          Environment:
+            - Name: STACK_KEY
+              Value: !Ref StackKey
+            - Name: AWS_REGION
+              Value: !Ref "AWS::Region"
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackKey}-${Environment}-application-task-definition"
+
+  ApplicationService:
+    Type: AWS::ECS::Service
+    DependsOn: ApplicationLoadBalancerRule
+    Properties:
+      ServiceName: !Sub ${StackKey}-${Environment}-application-service
+      Cluster: !Ref ApplicationEcsCluster
+      LaunchType: FARGATE
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 75
+      DesiredCount: 0
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !ImportValue
+              "Fn::Sub": ${StackKey}-${Environment}-container-security-group
+          Subnets:
+            - !ImportValue
+              "Fn::Sub": ${StackKey}-${Environment}-PrivateSubnet1
+            - !ImportValue
+              "Fn::Sub": ${StackKey}-${Environment}-PrivateSubnet2
+            - !If
+              - isProduction
+              - !ImportValue
+                "Fn::Sub": ${StackKey}-${Environment}-PrivateSubnet3
+              - AWS::NoValue
+      TaskDefinition: !Ref "ApplicationTaskDefinition"
+      LoadBalancers:
+        - ContainerName: ApplicationContainer
+          ContainerPort: 80
+          TargetGroupArn: !Ref "ApplicationTargetGroup"
+      Tags:
+        - Key: Name
+          Value: !Sub "{StackKey}-${Environment}-application-service"
+
+  ## DNS ##
+  SSLCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Sub "*.${HostedZoneDomain}"
+      SubjectAlternativeNames:
+        - !Ref "HostedZoneDomain"
+        - !Sub "*.${Domain}"
+      ValidationMethod: DNS
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-ssl-certificate"
+
+  ## Load Balancer Configuration ##
+  DefaultTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 6
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      Name: !Sub "${AWS::StackName}-drop-1"
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 2
+      VpcId: !ImportValue
+        "Fn::Sub": ${StackKey}-${Environment}-VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackKey}-${Environment}-default-target-group"
+
+  ApplicationTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: "/favicon.ico"
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      TargetType: ip
+      Name: !Sub ${StackKey}-${Environment}-application-targets
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 2
+      VpcId: !ImportValue
+        "Fn::Sub": ${StackKey}-${Environment}-VPC
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: 45
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackKey}-${Environment}-application-target-group"
+
+  ApplicationLoadBalancerAccessLogBucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName: !Sub ${StackKey}-${Environment}-alb-logs
+      LifecycleConfiguration:
+        Rules:
+          - ExpirationInDays: 60
+            NoncurrentVersionExpirationInDays: 1
+            Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: TRUE
+        BlockPublicPolicy: TRUE
+        IgnorePublicAcls: TRUE
+        RestrictPublicBuckets: TRUE
+
+  ApplicationLoadBalancerAccessLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ApplicationLoadBalancerAccessLogBucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Join
+                - ""
+                - - "arn:aws:iam::"
+                  - !FindInMap [RegionToELBAccount, !Ref "AWS::Region", id]
+                  - ":root"
+            Action: s3:PutObject
+            Resource:
+              [
+                !Sub "arn:aws:s3:::${ApplicationLoadBalancerAccessLogBucket}/${StackKey}-${Environment}-alb-log/AWSLogs/${AWS::AccountId}/*",
+              ]
+
+          - Effect: Allow
+            Principal:
+              Service: delivery.logs.amazonaws.com
+            Action: s3:PutObject
+            Resource:
+              [
+                !Sub "arn:aws:s3:::${ApplicationLoadBalancerAccessLogBucket}/${StackKey}-${Environment}-alb-log/AWSLogs/${AWS::AccountId}/*",
+              ]
+            Condition:
+              StringEquals:
+                "s3:x-amz-acl": bucket-owner-full-control
+
+          - Effect: Allow
+            Principal:
+              Service: delivery.logs.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !Sub "arn:aws:s3:::${ApplicationLoadBalancerAccessLogBucket}"
+
+  ApplicationLoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Access to the public facing load balancer
+      VpcId: !ImportValue
+        "Fn::Sub": ${StackKey}-${Environment}-VPC
+      SecurityGroupIngress:
+        # Allow access to ALB from anywhere on the internet
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+      Tags:
+        - Key: Name
+          Value: !Sub ${StackKey}-${Environment}-public-alb-sg
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn: ApplicationLoadBalancerAccessLogBucketPolicy
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      Name: !Sub "${StackKey}-${Environment}-load-balancer"
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: "120"
+        - Key: access_logs.s3.enabled
+          Value: "true"
+        - Key: access_logs.s3.bucket
+          Value: !Ref ApplicationLoadBalancerAccessLogBucket
+        - Key: access_logs.s3.prefix
+          Value: !Sub "${StackKey}-${Environment}-alb-log"
+      Subnets:
+        # The load balancer is placed into the public subnets, so that traffic
+        # from the internet can reach the load balancer directly via the internet gateway
+        - !ImportValue
+          "Fn::Sub": ${StackKey}-${Environment}-PublicSubnet1
+        - !ImportValue
+          "Fn::Sub": ${StackKey}-${Environment}-PublicSubnet2
+        - !If
+          - isProduction
+          - !ImportValue
+            "Fn::Sub": ${StackKey}-PublicSubnet3
+          - !Ref "AWS::NoValue"
+      SecurityGroups: [!Ref "ApplicationLoadBalancerSecurityGroup"]
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackKey}-${Environment}-public-load-balancer"
+
+  ApplicationLoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: "redirect"
+          RedirectConfig:
+            Port: "443"
+            Protocol: "HTTPS"
+            StatusCode: "HTTP_301"
+      LoadBalancerArn: !Ref "ApplicationLoadBalancer"
+      Port: 80
+      Protocol: HTTP
+
+  ApplicationSecureLoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      Certificates:
+        - CertificateArn: !Ref "SSLCertificate"
+      DefaultActions:
+        - TargetGroupArn: !Ref "DefaultTargetGroup"
+          Type: "forward"
+      LoadBalancerArn: !Ref "ApplicationLoadBalancer"
+      Port: 443
+      Protocol: HTTPS
+
+  ApplicationLoadBalancerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+        - TargetGroupArn: !Ref "ApplicationTargetGroup"
+          Type: "forward"
+      Conditions:
+        - Field: host-header
+          HostHeaderConfig:
+            Values:
+              - !Ref "Domain"
+              - !Sub "*.${Domain}"
+      ListenerArn: !Ref ApplicationSecureLoadBalancerListener
+      Priority: 104
+
+  # Add record set to point the subdomain to the public load balancer
+  ApplicationDNSRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneName: !Sub "${HostedZoneDomain}."
+      Name: !Sub "${Domain}"
+      Type: A
+      AliasTarget:
+        HostedZoneId: !GetAtt ApplicationLoadBalancer.CanonicalHostedZoneID
+        DNSName: !GetAtt ApplicationLoadBalancer.DNSName
+
+  CronImage:
+    Type: "AWS::ECR::Repository"
+    Properties:
+      RepositoryName: !Sub ${StackKey}-${Environment}-cron-image-repository
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":10,"description":"expire rev- after 25 images","selection":{"tagStatus":"tagged","tagPrefixList":["rev-"],"countType":"imageCountMoreThan","countNumber":25},"action":{"type":"expire"}}]}'
+        RegistryId: !Ref "AWS::AccountId"
+
+  QueueImage:
+    Type: "AWS::ECR::Repository"
+    Properties:
+      RepositoryName: !Sub ${StackKey}-${Environment}-queue-image-repository
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":10,"description":"expire rev- after 25 images","selection":{"tagStatus":"tagged","tagPrefixList":["rev-"],"countType":"imageCountMoreThan","countNumber":25},"action":{"type":"expire"}}]}'
+        RegistryId: !Ref "AWS::AccountId"
